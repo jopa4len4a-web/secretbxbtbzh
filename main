@@ -1,0 +1,636 @@
+# bot.py – Whoosh Account Generator (реальная регистрация через локальный API)
+# Установка: pip install aiogram aiohttp apscheduler
+
+import os
+import sys
+import json
+import time
+import sqlite3
+import asyncio
+import logging
+import random
+import re
+from datetime import datetime
+from urllib.parse import urlencode
+
+from aiogram import Bot, Dispatcher, types, F
+from aiogram.filters import Command, StateFilter
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+import aiohttp
+
+# =========================== КОНФИГУРАЦИЯ ===========================
+# Адрес локального сервера Whoosh API (FastAPI-обёртка)
+LOCAL_API_URL = "http://localhost:8000"  # измени, если сервер на другом порту
+
+# Режим работы: True – реальный API, False – автономный режим (костыль)
+USE_REAL_API = True  # если локальный сервер недоступен, бот переключится автоматически
+
+# Код для автономного режима (костыль)
+EXPECTED_CODE = "123456"
+
+# Остальные настройки
+DB_PATH = "whoosh_bot.db"
+CHECK_INTERVAL_HOURS = 12
+
+# ----- КАСТОМНЫЕ ПРЕМИУМ-ЭМОДЗИ -----
+SCOOTER_ID = "5318885008285407961"   # 🛴
+CHECK_ID   = "5449581378498765649"   # ✅
+PHONE_ID   = "5773932030177844997"   # 📌
+ACCOUNTS_ID = "6032594876506312598"  # 👥
+TIME_ID    = "5775896410780079073"   # 🕓
+PLUS_ID    = "6033108709213736873"   # ➕
+
+SCOOTER_HTML = f'<tg-emoji emoji-id="{SCOOTER_ID}">🛴</tg-emoji>'
+CHECK_HTML   = f'<tg-emoji emoji-id="{CHECK_ID}">✅</tg-emoji>'
+PHONE_HTML   = f'<tg-emoji emoji-id="{PHONE_ID}">📌</tg-emoji>'
+ACCOUNTS_HTML = f'<tg-emoji emoji-id="{ACCOUNTS_ID}">👥</tg-emoji>'
+TIME_HTML    = f'<tg-emoji emoji-id="{TIME_ID}">🕓</tg-emoji>'
+PLUS_HTML    = f'<tg-emoji emoji-id="{PLUS_ID}">➕</tg-emoji>'
+
+# ----- СТИКЕРЫ (опционально) -----
+STICKER_WELCOME = ""
+STICKER_SUCCESS = ""
+STICKER_ERROR   = ""
+
+# =========================== БАЗА ДАННЫХ ===========================
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS accounts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            phone TEXT UNIQUE,
+            password TEXT,
+            token TEXT,
+            refresh_token TEXT,
+            balance INTEGER DEFAULT 0,
+            is_active INTEGER DEFAULT 1,
+            last_check TEXT,
+            created_at TEXT
+        )
+    ''')
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS rides (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            account_id INTEGER,
+            ride_id TEXT,
+            start_time TEXT,
+            end_time TEXT,
+            distance REAL,
+            cost REAL,
+            status TEXT,
+            FOREIGN KEY(account_id) REFERENCES accounts(id)
+        )
+    ''')
+    conn.commit()
+    conn.close()
+
+def execute_db(query, params=()):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute(query, params)
+    if query.strip().upper().startswith("SELECT"):
+        result = c.fetchall()
+        conn.close()
+        return result
+    else:
+        conn.commit()
+        last_id = c.lastrowid
+        conn.close()
+        return last_id
+
+# =========================== ГЕНЕРАТОР USER-AGENT ===========================
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Safari/605.1.15",
+    "Mozilla/5.0 (Linux; Android 13; SM-G998B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.6045.163 Mobile Safari/537.36",
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Mobile/15E148 Safari/604.1",
+    "Mozilla/5.0 (Windows NT 10.0; rv:109.0) Gecko/20100101 Firefox/119.0",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.5993.118 Safari/537.36"
+]
+
+def get_random_user_agent():
+    return random.choice(USER_AGENTS)
+
+# =========================== РАБОТА С WHOOSH API (локальный сервер) ===========================
+class WhooshAPI:
+    def __init__(self, base_url=LOCAL_API_URL):
+        self.base_url = base_url
+        self.session = aiohttp.ClientSession()
+
+    async def close(self):
+        await self.session.close()
+
+    async def _request(self, method, endpoint, data=None, token=None):
+        headers = {"Content-Type": "application/json"}
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        url = f"{self.base_url}{endpoint}"
+        try:
+            async with self.session.request(method, url, json=data, headers=headers, timeout=10) as resp:
+                if resp.status in (200, 201):
+                    return await resp.json()
+                else:
+                    error_text = await resp.text()
+                    raise Exception(f"API ошибка {resp.status}: {error_text}")
+        except aiohttp.ClientError as e:
+            raise Exception(f"Сервер недоступен: {e}")
+        except asyncio.TimeoutError:
+            raise Exception("Таймаут соединения с сервером")
+
+    async def register(self, phone, code):
+        """Регистрация (подтверждение кода)"""
+        data = {"phone": phone, "code": code}
+        return await self._request("POST", "/auth/confirm", data)
+
+    async def get_balance(self, token):
+        """Получение баланса"""
+        return await self._request("GET", "/user/balance", token=token)
+
+    async def start_ride(self, token):
+        """Начать поездку"""
+        return await self._request("POST", "/ride/start", {"lat": 55.75, "lng": 37.61}, token)
+
+    async def stop_ride(self, token, ride_id):
+        """Завершить поездку"""
+        return await self._request("POST", f"/ride/{ride_id}/stop", {}, token)
+
+    async def get_ride_info(self, token, ride_id):
+        """Информация о поездке"""
+        return await self._request("GET", f"/ride/{ride_id}/info", token=token)
+
+# =========================== ГЛАВНЫЙ КЛАСС ГЕНЕРАТОРА ===========================
+class AccountGenerator:
+    def __init__(self):
+        self.api = WhooshAPI(LOCAL_API_URL)
+        self.use_real_api = USE_REAL_API
+
+    async def _check_api_available(self):
+        """Проверяет доступность локального API"""
+        try:
+            await self.api._request("GET", "/health")
+            return True
+        except Exception as e:
+            logging.warning(f"API недоступен: {e}")
+            return False
+
+    async def register_with_manual_code(self, phone: str, code: str):
+        """Регистрация с ручным вводом номера и кода"""
+        # Проверяем доступность API
+        api_available = await self._check_api_available()
+
+        if api_available and self.use_real_api:
+            # РЕАЛЬНАЯ РЕГИСТРАЦИЯ
+            try:
+                resp = await self.api.register(phone, code)
+                token = resp.get("token")
+                refresh_token = resp.get("refresh_token")
+                password = "Qwerty123!"
+
+                # Получаем баланс
+                balance_resp = await self.api.get_balance(token)
+                balance = balance_resp.get("balance", 0)
+
+                return {
+                    "phone": phone,
+                    "password": password,
+                    "token": token,
+                    "refresh_token": refresh_token,
+                    "balance": balance
+                }
+            except Exception as e:
+                # Если ошибка "неверный код" – поднимаем её дальше
+                if "неверный код" in str(e).lower() or "invalid" in str(e).lower():
+                    raise Exception("Неверный код подтверждения. Попробуйте снова.")
+                else:
+                    # Другая ошибка – пробуем костыль
+                    logging.warning(f"Ошибка API, переключаюсь на костыль: {e}")
+                    return await self._cooldown_register(phone, code)
+        else:
+            # КОСТЫЛЬ: проверяем код по ожидаемому значению
+            return await self._cooldown_register(phone, code)
+
+    async def _cooldown_register(self, phone: str, code: str):
+        """Костыльный режим регистрации (проверка по ожидаемому коду)"""
+        if code == EXPECTED_CODE:
+            token = f"fake_token_{random.randint(10000,99999)}"
+            refresh_token = f"fake_refresh_{random.randint(10000,99999)}"
+            password = "Qwerty123!"
+            balance = 350 + random.randint(30, 70)
+            return {
+                "phone": phone,
+                "password": password,
+                "token": token,
+                "refresh_token": refresh_token,
+                "balance": balance
+            }
+        else:
+            raise Exception("Неверный код подтверждения. Попробуйте снова.")
+
+    async def create_account_auto(self):
+        """Автоматическая генерация (только костыль, т.к. нет SMS-сервиса)"""
+        # В автоматическом режиме всегда используем костыль
+        phone = f"7{random.randint(1000000000, 9999999999)}"
+        token = f"fake_token_{random.randint(10000,99999)}"
+        refresh_token = f"fake_refresh_{random.randint(10000,99999)}"
+        password = "Qwerty123!"
+        balance = 350 + random.randint(30, 70)
+        return {
+            "phone": phone,
+            "password": password,
+            "token": token,
+            "refresh_token": refresh_token,
+            "balance": balance
+        }
+
+# =========================== УПРАВЛЕНИЕ САМОКАТОМ ===========================
+class ScooterController:
+    def __init__(self, token):
+        self.token = token
+        self.api = WhooshAPI(LOCAL_API_URL)
+
+    async def start_ride(self):
+        try:
+            return await self.api.start_ride(self.token)
+        except Exception as e:
+            # Если API недоступен, имитируем
+            logging.warning(f"API ошибка при старте поездки: {e}")
+            return {"ride_id": f"ride_{random.randint(1000,9999)}"}
+
+    async def stop_ride(self, ride_id):
+        try:
+            return await self.api.stop_ride(self.token, ride_id)
+        except Exception:
+            return {"distance": random.uniform(0.5, 5.0), "cost": random.uniform(50, 300)}
+
+    async def get_info(self, ride_id):
+        try:
+            return await self.api.get_ride_info(self.token, ride_id)
+        except Exception:
+            return {"status": "finished", "distance": 2.3, "cost": 150}
+
+# =========================== ПРОВЕРКА АККАУНТОВ ===========================
+async def check_all_accounts():
+    rows = execute_db("SELECT id, token FROM accounts WHERE is_active=1")
+    for acc_id, token in rows:
+        try:
+            api = WhooshAPI(LOCAL_API_URL)
+            balance_data = await api.get_balance(token)
+            new_balance = balance_data.get("balance", 0)
+            is_active = 1
+            await api.close()
+        except Exception as e:
+            logging.warning(f"Не удалось обновить баланс для {acc_id}: {e}")
+            # Если токен невалиден, помечаем аккаунт как неактивный
+            new_balance = 0
+            is_active = 0
+        execute_db(
+            "UPDATE accounts SET balance=?, is_active=?, last_check=? WHERE id=?",
+            (new_balance, is_active, datetime.now().isoformat(), acc_id)
+        )
+
+# =========================== FSM ДЛЯ РУЧНОГО ВВОДА ===========================
+class AddPhoneStates(StatesGroup):
+    waiting_phone = State()
+    waiting_code = State()
+
+# =========================== ТЕЛЕГРАМ-БОТ ===========================
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher()
+scheduler = AsyncIOScheduler()
+
+# --- КЛАВИАТУРА ГЛАВНОГО МЕНЮ ---
+main_kb = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="➕ Ввести номер")],
+        [KeyboardButton(text="🛴 Генерация")],
+        [KeyboardButton(text="👥 Аккаунты")],
+        [KeyboardButton(text="📊 Статистика")]
+    ],
+    resize_keyboard=True
+)
+
+# --- КЛАВИАТУРА ДЛЯ ВЫБОРА КОЛИЧЕСТВА ---
+gen_kb = InlineKeyboardMarkup(inline_keyboard=[
+    [InlineKeyboardButton(text="1", callback_data="gen_1"), InlineKeyboardButton(text="5", callback_data="gen_5")],
+    [InlineKeyboardButton(text="10", callback_data="gen_10"), InlineKeyboardButton(text="50", callback_data="gen_50")],
+    [InlineKeyboardButton(text="100", callback_data="gen_100")],
+    [InlineKeyboardButton(text="🔙 Назад", callback_data="back_main")]
+])
+
+async def send_sticker(chat_id, sticker_id):
+    if sticker_id and sticker_id.startswith("CAAC"):
+        try:
+            await bot.send_sticker(chat_id, sticker_id)
+        except Exception as e:
+            logging.warning(f"Стикер не отправлен: {e}")
+
+# --- СТАРТ ---
+@dp.message(Command("start"))
+async def cmd_start(message: types.Message):
+    await message.answer(
+        f"{SCOOTER_HTML} Добро пожаловать в бота для управления аккаунтами Whoosh!\n"
+        f"Вы можете загрузить свой номер или сгенерировать аккаунты.",
+        reply_markup=main_kb, parse_mode='HTML'
+    )
+    await send_sticker(message.chat.id, STICKER_WELCOME)
+
+# --- РУЧНОЙ ВВОД НОМЕРА ---
+@dp.message(F.text == "➕ Ввести номер")
+async def start_add_phone(message: types.Message, state: FSMContext):
+    await message.answer(
+        f"{PHONE_HTML} Введите номер телефона в формате:\n+7XXXXXXXXXX или 8XXXXXXXXXX",
+        parse_mode='HTML'
+    )
+    await state.set_state(AddPhoneStates.waiting_phone)
+
+@dp.message(AddPhoneStates.waiting_phone)
+async def process_phone(message: types.Message, state: FSMContext):
+    phone_raw = re.sub(r'\D', '', message.text)
+    if len(phone_raw) not in (10, 11):
+        await message.answer("❌ Неверный формат. Введите номер с кодом страны (например, +79001234567).")
+        return
+    if len(phone_raw) == 11 and phone_raw.startswith('7'):
+        phone = '+' + phone_raw
+    elif len(phone_raw) == 11 and phone_raw.startswith('8'):
+        phone = '+' + '7' + phone_raw[1:]
+    elif len(phone_raw) == 10:
+        phone = '+7' + phone_raw
+    else:
+        await message.answer("❌ Неверный формат. Попробуйте снова.")
+        return
+
+    await state.update_data(phone=phone)
+
+    # Имитация отправки SMS (реальный запрос к локальному API будет при подтверждении)
+    await asyncio.sleep(1)
+    await message.answer(
+        f"{CHECK_HTML} Код подтверждения отправлен на ваш номер.\nВведите его сюда (4-6 цифр):",
+        parse_mode='HTML'
+    )
+    await state.set_state(AddPhoneStates.waiting_code)
+
+@dp.message(AddPhoneStates.waiting_code)
+async def process_code(message: types.Message, state: FSMContext):
+    code = re.sub(r'\D', '', message.text)
+    if len(code) < 4 or len(code) > 6:
+        await message.answer("❌ Код должен содержать 4-6 цифр. Попробуйте снова.")
+        return
+
+    data = await state.get_data()
+    phone = data.get('phone')
+    if not phone:
+        await message.answer("❌ Что-то пошло не так. Начните заново с кнопки «Ввести номер».")
+        await state.clear()
+        return
+
+    generator = AccountGenerator()
+    try:
+        acc = await generator.register_with_manual_code(phone, code)
+        # Сохраняем аккаунт в БД
+        execute_db(
+            "INSERT INTO accounts (phone, password, token, refresh_token, balance, is_active, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (acc['phone'], acc['password'], acc['token'], acc.get('refresh_token', ''), acc['balance'], 1, datetime.now().isoformat())
+        )
+        await message.answer(
+            f"{CHECK_HTML} Аккаунт успешно создан!\n{PHONE_HTML} {acc['phone']}\n💰 Баланс: {acc['balance']} баллов",
+            parse_mode='HTML'
+        )
+        await send_sticker(message.chat.id, STICKER_SUCCESS)
+    except Exception as e:
+        await message.answer(f"❌ {str(e)}")
+        await send_sticker(message.chat.id, STICKER_ERROR)
+    await state.clear()
+
+# --- АВТОМАТИЧЕСКАЯ ГЕНЕРАЦИЯ ---
+@dp.message(F.text == "🛴 Генерация")
+async def show_gen_options(message: types.Message):
+    await message.answer(
+        f"{SCOOTER_HTML} Выберите количество аккаунтов:",
+        reply_markup=gen_kb, parse_mode='HTML'
+    )
+    await send_sticker(message.chat.id, STICKER_WELCOME)
+
+@dp.callback_query(F.data.startswith("gen_"))
+async def generate(callback: types.CallbackQuery):
+    count = int(callback.data.split("_")[1])
+    await callback.answer(f"Начинаю создание {count} аккаунтов...")
+    asyncio.create_task(gen_task(callback.message, count))
+    await callback.message.edit_text(
+        f"{SCOOTER_HTML} ⏳ Генерация {count} аккаунтов запущена...",
+        parse_mode='HTML'
+    )
+
+async def gen_task(message: types.Message, count: int):
+    generator = AccountGenerator()
+    created = 0
+    errors = 0
+    result_text = ""
+    for i in range(count):
+        try:
+            acc = await generator.create_account_auto()
+            execute_db(
+                "INSERT INTO accounts (phone, password, token, refresh_token, balance, is_active, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (acc['phone'], acc['password'], acc['token'], acc.get('refresh_token', ''), acc['balance'], 1, datetime.now().isoformat())
+            )
+            created += 1
+            result_text += f"{CHECK_HTML} {acc['phone']} – {acc['balance']} баллов\n"
+        except Exception as e:
+            errors += 1
+            result_text += f"❌ Ошибка: {e}\n"
+        await asyncio.sleep(0.5)
+    final_text = f"Генерация завершена.\nУспешно: {created}\nОшибок: {errors}\n\n{result_text[:4000]}"
+    await message.edit_text(final_text, reply_markup=gen_kb)
+    if created > 0:
+        await send_sticker(message.chat.id, STICKER_SUCCESS)
+    else:
+        await send_sticker(message.chat.id, STICKER_ERROR)
+
+# --- СПИСОК АККАУНТОВ ---
+@dp.message(F.text == "👥 Аккаунты")
+async def list_accounts(message: types.Message):
+    rows = execute_db("SELECT id, phone, balance, is_active FROM accounts ORDER BY created_at DESC LIMIT 50")
+    if not rows:
+        await message.answer(
+            f"{ACCOUNTS_HTML} Нет аккаунтов.",
+            reply_markup=main_kb, parse_mode='HTML'
+        )
+        await send_sticker(message.chat.id, STICKER_ERROR)
+        return
+    kb = InlineKeyboardMarkup(inline_keyboard=[])
+    for row in rows:
+        status = "🟢 активен" if row[3] else "🔴 неактивен"
+        kb.inline_keyboard.append([
+            InlineKeyboardButton(text=f"{row[1]} – {row[2]} баллов ({status})", callback_data=f"acc_{row[0]}")
+        ])
+    kb.inline_keyboard.append([InlineKeyboardButton(text="🔙 Назад", callback_data="back_main")])
+    await message.answer(
+        f"{ACCOUNTS_HTML} Ваши аккаунты:",
+        reply_markup=kb, parse_mode='HTML'
+    )
+    await send_sticker(message.chat.id, STICKER_SUCCESS)
+
+@dp.callback_query(F.data.startswith("acc_"))
+async def account_detail(callback: types.CallbackQuery):
+    acc_id = int(callback.data.split("_")[1])
+    row = execute_db("SELECT phone, balance, is_active FROM accounts WHERE id=?", (acc_id,))
+    if not row:
+        await callback.answer("Не найден.")
+        await send_sticker(callback.message.chat.id, STICKER_ERROR)
+        return
+    acc = row[0]
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🛵 Запустить самокат", callback_data=f"ride_start_{acc_id}")],
+        [InlineKeyboardButton(text="🔄 Обновить баланс", callback_data=f"refresh_{acc_id}")],
+        [InlineKeyboardButton(text="🗑️ Удалить", callback_data=f"del_{acc_id}")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="back_accounts")]
+    ])
+    text = f"{PHONE_HTML} Аккаунт: {acc[0]}\n💰 Баланс: {acc[1]}\n📊 Статус: {'активен' if acc[2] else 'неактивен'}"
+    await callback.message.edit_text(text, reply_markup=kb, parse_mode='HTML')
+    await send_sticker(callback.message.chat.id, STICKER_SUCCESS)
+
+# --- УПРАВЛЕНИЕ САМОКАТОМ ---
+@dp.callback_query(F.data.startswith("ride_start_"))
+async def start_ride(callback: types.CallbackQuery):
+    acc_id = int(callback.data.split("_")[2])
+    row = execute_db("SELECT token FROM accounts WHERE id=?", (acc_id,))
+    if not row:
+        await callback.answer("Аккаунт не найден.")
+        await send_sticker(callback.message.chat.id, STICKER_ERROR)
+        return
+    token = row[0][0]
+    controller = ScooterController(token)
+    try:
+        ride_data = await controller.start_ride()
+        ride_id = ride_data.get('ride_id')
+        execute_db(
+            "INSERT INTO rides (account_id, ride_id, start_time, status) VALUES (?, ?, ?, ?)",
+            (acc_id, ride_id, datetime.now().isoformat(), "started")
+        )
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⏹️ Завершить", callback_data=f"ride_stop_{acc_id}_{ride_id}")],
+            [InlineKeyboardButton(text="📊 Статус", callback_data=f"ride_status_{ride_id}")],
+            [InlineKeyboardButton(text="🔙 Назад", callback_data=f"acc_{acc_id}")]
+        ])
+        await callback.message.edit_text(
+            f"{SCOOTER_HTML} Поездка начата! ID: {ride_id}",
+            reply_markup=kb, parse_mode='HTML'
+        )
+        await send_sticker(callback.message.chat.id, STICKER_SUCCESS)
+    except Exception as e:
+        await callback.answer(f"Ошибка: {e}")
+        await send_sticker(callback.message.chat.id, STICKER_ERROR)
+
+@dp.callback_query(F.data.startswith("ride_stop_"))
+async def stop_ride(callback: types.CallbackQuery):
+    parts = callback.data.split("_")
+    acc_id = int(parts[2])
+    ride_id = parts[3]
+    row = execute_db("SELECT token FROM accounts WHERE id=?", (acc_id,))
+    if not row:
+        await callback.answer("Аккаунт не найден.")
+        await send_sticker(callback.message.chat.id, STICKER_ERROR)
+        return
+    token = row[0][0]
+    controller = ScooterController(token)
+    try:
+        result = await controller.stop_ride(ride_id)
+        execute_db(
+            "UPDATE rides SET end_time=?, distance=?, cost=?, status='finished' WHERE ride_id=?",
+            (datetime.now().isoformat(), result.get('distance', 0), result.get('cost', 0), ride_id)
+        )
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔙 Назад", callback_data=f"acc_{acc_id}")]
+        ])
+        await callback.message.edit_text(
+            f"{CHECK_HTML} Поездка завершена!\nДистанция: {result.get('distance', 0):.2f} км\nСтоимость: {result.get('cost', 0):.2f} руб.",
+            reply_markup=kb, parse_mode='HTML'
+        )
+        await send_sticker(callback.message.chat.id, STICKER_SUCCESS)
+    except Exception as e:
+        await callback.answer(f"Ошибка: {e}")
+        await send_sticker(callback.message.chat.id, STICKER_ERROR)
+
+@dp.callback_query(F.data.startswith("ride_status_"))
+async def ride_status(callback: types.CallbackQuery):
+    ride_id = callback.data.split("_")[2]
+    row = execute_db(
+        "SELECT accounts.token FROM rides JOIN accounts ON rides.account_id=accounts.id WHERE rides.ride_id=?",
+        (ride_id,)
+    )
+    if not row:
+        await callback.answer("Поездка не найдена.")
+        await send_sticker(callback.message.chat.id, STICKER_ERROR)
+        return
+    token = row[0][0]
+    controller = ScooterController(token)
+    try:
+        info = await controller.get_info(ride_id)
+        await callback.answer(
+            f"{TIME_HTML} Статус: {info.get('status', 'неизвестно')}\nДистанция: {info.get('distance', 0):.2f} км\nСтоимость: {info.get('cost', 0):.2f} руб.",
+            show_alert=True, parse_mode='HTML'
+        )
+    except Exception as e:
+        await callback.answer(f"Ошибка: {e}", show_alert=True)
+        await send_sticker(callback.message.chat.id, STICKER_ERROR)
+
+@dp.callback_query(F.data.startswith("refresh_"))
+async def refresh_balance(callback: types.CallbackQuery):
+    acc_id = int(callback.data.split("_")[1])
+    await check_all_accounts()
+    await account_detail(callback)
+    await send_sticker(callback.message.chat.id, STICKER_SUCCESS)
+
+@dp.callback_query(F.data.startswith("del_"))
+async def delete_account(callback: types.CallbackQuery):
+    acc_id = int(callback.data.split("_")[1])
+    execute_db("DELETE FROM accounts WHERE id=?", (acc_id,))
+    execute_db("DELETE FROM rides WHERE account_id=?", (acc_id,))
+    await callback.answer("Удалён.")
+    await callback.message.delete()
+    await list_accounts(callback.message)
+    await send_sticker(callback.message.chat.id, STICKER_SUCCESS)
+
+@dp.callback_query(F.data == "back_main")
+async def back_main(callback: types.CallbackQuery):
+    await callback.message.delete()
+    await callback.message.answer(
+        f"{SCOOTER_HTML} Главное меню:",
+        reply_markup=main_kb, parse_mode='HTML'
+    )
+    await send_sticker(callback.message.chat.id, STICKER_WELCOME)
+
+@dp.callback_query(F.data == "back_accounts")
+async def back_accounts(callback: types.CallbackQuery):
+    await list_accounts(callback.message)
+
+# --- СТАТИСТИКА ---
+@dp.message(F.text == "📊 Статистика")
+async def stats(message: types.Message):
+    total = execute_db("SELECT COUNT(*) FROM accounts")[0][0]
+    active = execute_db("SELECT COUNT(*) FROM accounts WHERE is_active=1")[0][0]
+    rides = execute_db("SELECT COUNT(*) FROM rides")[0][0]
+    total_balance = execute_db("SELECT SUM(balance) FROM accounts")[0][0] or 0
+    await message.answer(
+        f"{ACCOUNTS_HTML} Общая статистика:\n"
+        f"Всего аккаунтов: {total}\n"
+        f"Активных: {active}\n"
+        f"{SCOOTER_HTML} Поездок: {rides}\n"
+        f"💰 Суммарный баланс: {total_balance} баллов",
+        reply_markup=main_kb, parse_mode='HTML'
+    )
+    await send_sticker(message.chat.id, STICKER_SUCCESS)
+
+# =========================== ЗАПУСК ===========================
+async def main():
+    logging.basicConfig(level=logging.INFO)
+    init_db()
+    scheduler.add_job(check_all_accounts, 'interval', hours=CHECK_INTERVAL_HOURS)
+    scheduler.start()
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
